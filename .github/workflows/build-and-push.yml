@@ -1,0 +1,116 @@
+name: Build and publish hosted image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: hosted-image-main
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    # Configure these repository variables after creating the Google Cloud
+    # Workload Identity provider and publisher service account.
+    if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GCP_DEPLOY_SERVICE_ACCOUNT != '' && vars.GCP_PROJECT_ID != '' }}
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: europe-west1
+      AR_REPOSITORY: highlights
+      IMAGE_NAME: hosted
+      HOSTED_ANALYSIS_GROUP_WINDOWS: "8"
+      HOSTED_ANALYSIS_CANDIDATE_REFINEMENT: "true"
+      HOSTED_ANALYSIS_REFINEMENT_FRAMES: "9"
+      HOSTED_ANALYSIS_RESCUE_THRESHOLD: "0.05"
+      HOSTED_ANALYSIS_RESCUE_MISSED: "false"
+      HOSTED_ANALYSIS_RESCUE_MAX_REQUESTS: "0"
+      HOSTED_ANALYSIS_DIRECT_SOURCE: "true"
+      HOSTED_ANALYSIS_TIMESTAMP_DECODER: "true"
+      HOSTED_ANALYSIS_PREFETCH_REQUESTS: "4"
+      HOSTED_ANALYSIS_ROLLING_SCHEDULER: "false"
+      HOSTED_ANALYSIS_CHRONOLOGICAL_EVIDENCE: "true"
+      HOSTED_ANALYSIS_DECODER_THREAD_TYPE: "AUTO"
+      HOSTED_ANALYSIS_DECODER_THREADS: "2"
+      HOSTED_ANALYSIS_OVERLAP_PREVIEW_UPLOADS: "true"
+      HOSTED_WORKER_MEMORY_GIB: "8"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify media lifecycle and rendered exports
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -r hosted/requirements.txt
+          python -m pytest tests -q
+
+      - name: Authenticate to Google Cloud with Workload Identity Federation
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Apply worker memory headroom
+        run: |
+          gcloud run jobs update highlights-worker \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --memory "${HOSTED_WORKER_MEMORY_GIB}Gi" \
+            --update-env-vars "WORKER_MEMORY_GIB=${HOSTED_WORKER_MEMORY_GIB}" \
+            --quiet
+
+      - name: Build and publish image
+        env:
+          IMAGE_URI: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}
+        run: |
+          docker build \
+            --file hosted/Dockerfile \
+            --tag "${IMAGE_URI}:${GITHUB_SHA}" \
+            --tag "${IMAGE_URI}:staging" \
+            .
+          docker push "${IMAGE_URI}:${GITHUB_SHA}"
+          docker push "${IMAGE_URI}:staging"
+
+      - name: Update analysis worker
+        env:
+          IMAGE_URI: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}
+        run: |
+          gcloud run jobs update highlights-worker \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --image "${IMAGE_URI}:${GITHUB_SHA}" \
+            --memory "${HOSTED_WORKER_MEMORY_GIB}Gi" \
+            --update-env-vars "ANALYSIS_PIPELINE_VERSION=2,ANALYSIS_GROUP_WINDOWS=${HOSTED_ANALYSIS_GROUP_WINDOWS},ANALYSIS_CANDIDATE_REFINEMENT=${HOSTED_ANALYSIS_CANDIDATE_REFINEMENT},ANALYSIS_REFINEMENT_FRAMES=${HOSTED_ANALYSIS_REFINEMENT_FRAMES},ANALYSIS_RESCUE_THRESHOLD=${HOSTED_ANALYSIS_RESCUE_THRESHOLD},ANALYSIS_RESCUE_MISSED=${HOSTED_ANALYSIS_RESCUE_MISSED},ANALYSIS_RESCUE_MAX_REQUESTS=${HOSTED_ANALYSIS_RESCUE_MAX_REQUESTS},ANALYSIS_DIRECT_SOURCE=${HOSTED_ANALYSIS_DIRECT_SOURCE},ANALYSIS_TIMESTAMP_DECODER=${HOSTED_ANALYSIS_TIMESTAMP_DECODER},ANALYSIS_PREFETCH_REQUESTS=${HOSTED_ANALYSIS_PREFETCH_REQUESTS},ANALYSIS_ROLLING_SCHEDULER=${HOSTED_ANALYSIS_ROLLING_SCHEDULER},ANALYSIS_CHRONOLOGICAL_EVIDENCE=${HOSTED_ANALYSIS_CHRONOLOGICAL_EVIDENCE},ANALYSIS_DECODER_THREAD_TYPE=${HOSTED_ANALYSIS_DECODER_THREAD_TYPE},ANALYSIS_DECODER_THREADS=${HOSTED_ANALYSIS_DECODER_THREADS},ANALYSIS_OVERLAP_PREVIEW_UPLOADS=${HOSTED_ANALYSIS_OVERLAP_PREVIEW_UPLOADS},WORKER_MEMORY_GIB=${HOSTED_WORKER_MEMORY_GIB}" \
+            --quiet
+
+      - name: Deploy web service
+        env:
+          IMAGE_URI: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}
+        run: |
+          gcloud run services update highlights-web \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --image "${IMAGE_URI}:${GITHUB_SHA}" \
+            --update-env-vars "ANALYSIS_PIPELINE_VERSION=2,ANALYSIS_GROUP_WINDOWS=${HOSTED_ANALYSIS_GROUP_WINDOWS},ANALYSIS_CANDIDATE_REFINEMENT=${HOSTED_ANALYSIS_CANDIDATE_REFINEMENT},ANALYSIS_REFINEMENT_FRAMES=${HOSTED_ANALYSIS_REFINEMENT_FRAMES},ANALYSIS_RESCUE_THRESHOLD=${HOSTED_ANALYSIS_RESCUE_THRESHOLD},ANALYSIS_RESCUE_MISSED=${HOSTED_ANALYSIS_RESCUE_MISSED},ANALYSIS_RESCUE_MAX_REQUESTS=${HOSTED_ANALYSIS_RESCUE_MAX_REQUESTS},ANALYSIS_DIRECT_SOURCE=${HOSTED_ANALYSIS_DIRECT_SOURCE},ANALYSIS_TIMESTAMP_DECODER=${HOSTED_ANALYSIS_TIMESTAMP_DECODER},ANALYSIS_PREFETCH_REQUESTS=${HOSTED_ANALYSIS_PREFETCH_REQUESTS},ANALYSIS_ROLLING_SCHEDULER=${HOSTED_ANALYSIS_ROLLING_SCHEDULER},ANALYSIS_CHRONOLOGICAL_EVIDENCE=${HOSTED_ANALYSIS_CHRONOLOGICAL_EVIDENCE},ANALYSIS_DECODER_THREAD_TYPE=${HOSTED_ANALYSIS_DECODER_THREAD_TYPE},ANALYSIS_DECODER_THREADS=${HOSTED_ANALYSIS_DECODER_THREADS},ANALYSIS_OVERLAP_PREVIEW_UPLOADS=${HOSTED_ANALYSIS_OVERLAP_PREVIEW_UPLOADS},WORKER_MEMORY_GIB=${HOSTED_WORKER_MEMORY_GIB}" \
+            --quiet
